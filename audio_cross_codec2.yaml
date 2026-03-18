@@ -1,0 +1,17 @@
+bind_host: 0.0.0.0
+codec_mode: '1300'
+input_device: null
+input_device_name: null
+input_gain: 1.0
+listen_port: 5001
+output_device: null
+output_device_name: null
+peer_host: 133.68.93.163
+peer_port: 5000
+ping_interval_s: 0.5
+preemphasis: 0.0
+recv_queue_frames: 4
+samplerate: 8000
+ttl_ping_s: 1.0
+vad_hangover_frames: 2
+vad_threshold: 700

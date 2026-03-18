@@ -35,7 +35,7 @@ Ubuntu/Linux 向けの、双方向マイク/スピーカー交換用のオフラ
 
 ```bash
 sudo apt update
-sudo apt install -y python3-tk python3-pip portaudio19-dev libcodec2-1.2
+sudo apt install -y python3-tk python3-pip portaudio19-dev libcodec2-1.2 libportaudio2
 pip install numpy sounddevice
 ```
 

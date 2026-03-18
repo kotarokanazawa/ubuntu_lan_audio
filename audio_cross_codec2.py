@@ -9,6 +9,8 @@ Features
 - VAD/DTX (do not send silence) to reduce average bandwidth
 - Tkinter GUI and CLI in a single file
 - Separate input/output device selection by ID or device name
+- YAML save/load for configuration
+- Communication test and richer connection state display
 - Works offline on a LAN
 """
 
@@ -17,13 +19,15 @@ from __future__ import annotations
 import argparse
 import ctypes
 import ctypes.util
+import os
 import queue
 import socket
 import struct
 import sys
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -35,6 +39,11 @@ except Exception as e:  # pragma: no cover
     _SOUNDDEVICE_IMPORT_ERROR = e
 else:
     _SOUNDDEVICE_IMPORT_ERROR = None
+
+try:  # optional
+    import yaml  # type: ignore
+except Exception:  # pragma: no cover
+    yaml = None
 
 # =========================
 # Codec2 binding
@@ -123,6 +132,9 @@ MAGIC = b"C2A1"
 PROTO_VERSION = 1
 PKT_AUDIO = 1
 PKT_PING = 2
+PKT_PONG = 3
+PKT_TEST = 4
+PKT_TEST_REPLY = 5
 HEADER_STRUCT = struct.Struct("!4sBBBBI")
 MODE_ID_TO_NAME = {v: k for k, v in CODEC2_MODES.items()}
 
@@ -190,33 +202,28 @@ def _normalize_name(s: str) -> str:
 
 
 def resolve_device(direction: str, device_id: Optional[int], device_name: Optional[str]) -> Optional[int]:
-    if device_id is not None:
-        return device_id
-    if not device_name:
-        return None
-
-    devs = query_audio_devices()
-    wanted = _normalize_name(device_name)
-    key = "max_input_channels" if direction == "input" else "max_output_channels"
-
-    exact: List[Tuple[int, Dict[str, Any]]] = []
-    partial: List[Tuple[int, Dict[str, Any]]] = []
-    for idx, dev in enumerate(devs):
-        if int(dev.get(key, 0)) <= 0:
-            continue
-        current = _normalize_name(str(dev.get("name", "")))
-        if current == wanted:
-            exact.append((idx, dev))
-        elif wanted in current:
-            partial.append((idx, dev))
-
-    matches = exact or partial
-    if not matches:
-        raise ValueError(f"No {direction} device matched name: {device_name}")
-    if len(matches) > 1:
-        sample = ", ".join(f"[{idx}] {dev['name']}" for idx, dev in matches[:8])
-        raise ValueError(f"Ambiguous {direction} device name '{device_name}'. Matches: {sample}")
-    return matches[0][0]
+    if device_name:
+        devs = query_audio_devices()
+        wanted = _normalize_name(device_name)
+        key = "max_input_channels" if direction == "input" else "max_output_channels"
+        exact: List[Tuple[int, Dict[str, Any]]] = []
+        partial: List[Tuple[int, Dict[str, Any]]] = []
+        for idx, dev in enumerate(devs):
+            if int(dev.get(key, 0)) <= 0:
+                continue
+            current = _normalize_name(str(dev.get("name", "")))
+            if current == wanted:
+                exact.append((idx, dev))
+            elif wanted in current:
+                partial.append((idx, dev))
+        matches = exact or partial
+        if not matches:
+            raise ValueError(f"No {direction} device matched name: {device_name}")
+        if len(matches) > 1:
+            sample = ", ".join(f"[{idx}] {dev['name']}" for idx, dev in matches[:8])
+            raise ValueError(f"Ambiguous {direction} device name '{device_name}'. Matches: {sample}")
+        return matches[0][0]
+    return device_id
 
 
 def describe_device(device_id: Optional[int]) -> str:
@@ -229,6 +236,96 @@ def describe_device(device_id: Optional[int]) -> str:
     except Exception:
         pass
     return str(device_id)
+
+
+# =========================
+# YAML helpers
+# =========================
+
+CONFIG_KEYS = {
+    "peer_host",
+    "peer_port",
+    "listen_port",
+    "codec_mode",
+    "samplerate",
+    "input_device",
+    "output_device",
+    "input_device_name",
+    "output_device_name",
+    "vad_threshold",
+    "vad_hangover_frames",
+    "preemphasis",
+    "input_gain",
+    "recv_queue_frames",
+    "bind_host",
+    "ttl_ping_s",
+    "ping_interval_s",
+}
+
+
+def _parse_scalar(value: str) -> Any:
+    v = value.strip()
+    if v in {"", "null", "Null", "NULL", "~"}:
+        return None
+    if v in {"true", "True", "TRUE"}:
+        return True
+    if v in {"false", "False", "FALSE"}:
+        return False
+    if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
+        return v[1:-1]
+    try:
+        if "." in v or "e" in v.lower():
+            return float(v)
+        return int(v)
+    except Exception:
+        return v
+
+
+def _simple_yaml_load(path: str) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for raw in Path(path).read_text(encoding="utf-8").splitlines():
+        line = raw.split("#", 1)[0].rstrip()
+        if not line or ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        out[key.strip()] = _parse_scalar(value)
+    return out
+
+
+def load_config_yaml(path: str) -> Dict[str, Any]:
+    if yaml is not None:
+        data = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
+        if not isinstance(data, dict):
+            raise ValueError("Config YAML must be a mapping")
+        return {k: data.get(k) for k in CONFIG_KEYS if k in data}
+    return {k: v for k, v in _simple_yaml_load(path).items() if k in CONFIG_KEYS}
+
+
+def _simple_yaml_dump(data: Dict[str, Any]) -> str:
+    def fmt(v: Any) -> str:
+        if v is None:
+            return "null"
+        if isinstance(v, bool):
+            return "true" if v else "false"
+        if isinstance(v, (int, float)):
+            return str(v)
+        s = str(v)
+        if s == "" or ":" in s or "#" in s or s.strip() != s or " " in s:
+            return '"' + s.replace('"', '\\"') + '"'
+        return s
+
+    lines = ["# audio_cross_codec2 configuration"]
+    for key in sorted(data.keys()):
+        lines.append(f"{key}: {fmt(data[key])}")
+    return "\n".join(lines) + "\n"
+
+
+def save_config_yaml(path: str, data: Dict[str, Any]) -> None:
+    data = {k: data.get(k) for k in CONFIG_KEYS}
+    if yaml is not None:
+        Path(path).write_text(yaml.safe_dump(data, sort_keys=True, allow_unicode=True), encoding="utf-8")
+    else:
+        Path(path).write_text(_simple_yaml_dump(data), encoding="utf-8")
 
 
 # =========================
@@ -268,6 +365,11 @@ class AudioStats:
     last_rx_seq: Optional[int] = None
     rx_seq_gaps: int = 0
     started_at: float = field(default_factory=time.time)
+    last_pong_at: float = 0.0
+    last_test_reply_at: float = 0.0
+    last_test_rtt_ms: Optional[float] = None
+    test_requests: int = 0
+    test_replies: int = 0
 
     def avg_kbps(self) -> float:
         dt = max(0.001, time.time() - self.started_at)
@@ -305,6 +407,13 @@ class AudioBridge:
         self.stats = AudioStats()
         self._last_ping_tx = 0.0
         self._last_peer_seen = 0.0
+        self._lock = threading.Lock()
+
+    def _next_seq(self) -> int:
+        with self._lock:
+            seq = self.seq
+            self.seq = (self.seq + 1) & 0xFFFFFFFF
+        return seq
 
     def _get_rx_codec(self, mode_id: int) -> Codec2:
         if mode_id not in self.rx_codecs:
@@ -387,6 +496,17 @@ class AudioBridge:
         self.stats.tx_packets += 1
         self.stats.tx_bytes_udp_payload += len(payload)
 
+    def send_ping(self) -> None:
+        pkt = build_packet(PKT_PING, self.tx_codec.mode_id, 0, self._next_seq(), b"")
+        self._sendto(pkt)
+
+    def send_test(self) -> None:
+        token = struct.pack("!Q", time.monotonic_ns())
+        pkt = build_packet(PKT_TEST, self.tx_codec.mode_id, 0, self._next_seq(), token)
+        self._sendto(pkt)
+        self.stats.test_requests += 1
+        self.log("Connection test packet sent")
+
     def _on_input(self, indata, frames, time_info, status) -> None:
         if status:
             self.log(f"Input status: {status}")
@@ -414,8 +534,7 @@ class AudioBridge:
             return
 
         encoded = self.tx_codec.encode(pcm)
-        packet = build_packet(PKT_AUDIO, self.tx_codec.mode_id, 0, self.seq, encoded)
-        self.seq = (self.seq + 1) & 0xFFFFFFFF
+        packet = build_packet(PKT_AUDIO, self.tx_codec.mode_id, 0, self._next_seq(), encoded)
         try:
             self._sendto(packet)
             self.stats.tx_voice_frames += 1
@@ -448,14 +567,43 @@ class AudioBridge:
             self.stats.rx_packets += 1
             self.stats.rx_bytes_udp_payload += len(data)
 
+            if pkt_type == PKT_PING:
+                try:
+                    pkt = build_packet(PKT_PONG, self.tx_codec.mode_id, 0, self._next_seq(), b"")
+                    self._sendto(pkt)
+                except OSError:
+                    pass
+                continue
+
+            if pkt_type == PKT_PONG:
+                self.stats.last_pong_at = time.time()
+                continue
+
+            if pkt_type == PKT_TEST:
+                try:
+                    pkt = build_packet(PKT_TEST_REPLY, self.tx_codec.mode_id, 0, self._next_seq(), payload)
+                    self._sendto(pkt)
+                except OSError:
+                    pass
+                continue
+
+            if pkt_type == PKT_TEST_REPLY:
+                self.stats.test_replies += 1
+                self.stats.last_test_reply_at = time.time()
+                if len(payload) == 8:
+                    sent_ns = struct.unpack("!Q", payload)[0]
+                    self.stats.last_test_rtt_ms = (time.monotonic_ns() - sent_ns) / 1e6
+                    self.log(f"Connection test reply received: RTT={self.stats.last_test_rtt_ms:.1f} ms")
+                else:
+                    self.log("Connection test reply received")
+                continue
+
             if self.stats.last_rx_seq is not None and seq != ((self.stats.last_rx_seq + 1) & 0xFFFFFFFF):
                 gap = (seq - self.stats.last_rx_seq - 1) & 0xFFFFFFFF
                 if gap < (1 << 31):
                     self.stats.rx_seq_gaps += gap
             self.stats.last_rx_seq = seq
 
-            if pkt_type == PKT_PING:
-                continue
             if pkt_type != PKT_AUDIO:
                 continue
             try:
@@ -483,20 +631,39 @@ class AudioBridge:
             if now - self._last_ping_tx >= self.cfg.ping_interval_s:
                 self._last_ping_tx = now
                 try:
-                    pkt = build_packet(PKT_PING, self.tx_codec.mode_id, 0, self.seq, b"")
-                    self._sendto(pkt)
+                    self.send_ping()
                 except OSError:
                     pass
             time.sleep(0.05)
 
+    def connection_state(self) -> str:
+        now = time.time()
+        peer_age = now - self._last_peer_seen if self._last_peer_seen else float("inf")
+        pong_age = now - self.stats.last_pong_at if self.stats.last_pong_at else float("inf")
+        test_age = now - self.stats.last_test_reply_at if self.stats.last_test_reply_at else float("inf")
+
+        if peer_age < self.cfg.ttl_ping_s and pong_age < self.cfg.ttl_ping_s * 2.0:
+            base = "connected"
+        elif peer_age < self.cfg.ttl_ping_s * 2.0:
+            base = "rx-only"
+        else:
+            base = "waiting"
+
+        parts = [base]
+        if peer_age < 999:
+            parts.append(f"last_rx={peer_age:.1f}s")
+        if pong_age < 999:
+            parts.append(f"last_pong={pong_age:.1f}s")
+        if self.stats.last_test_rtt_ms is not None and test_age < 30.0:
+            parts.append(f"rtt={self.stats.last_test_rtt_ms:.1f}ms")
+        return " ".join(parts)
+
     def status_text(self) -> str:
         frame_ms = 1000.0 * self.frame_samples / self.cfg.samplerate
-        peer_age = time.time() - self._last_peer_seen if self._last_peer_seen else float("inf")
-        peer_state = "online" if peer_age < self.cfg.ttl_ping_s else "waiting"
         return (
             f"codec2={self.cfg.codec_mode} frame={frame_ms:.1f}ms avg_tx={self.stats.avg_kbps():.2f}kbps "
             f"tx_voice={self.stats.tx_voice_frames} dtx_drop={self.stats.tx_dtx_drops} "
-            f"rx_gap={self.stats.rx_seq_gaps} peer={peer_state} "
+            f"rx_gap={self.stats.rx_seq_gaps} link={self.connection_state()} "
             f"in={describe_device(self.cfg.input_device)} out={describe_device(self.cfg.output_device)}"
         )
 
@@ -505,16 +672,16 @@ class AudioBridge:
 # GUI
 # =========================
 
-
 def run_gui(default_args: argparse.Namespace) -> None:
     import tkinter as tk
-    from tkinter import messagebox, scrolledtext, ttk
+    from tkinter import filedialog, messagebox, scrolledtext, ttk
 
     root = tk.Tk()
     root.title("Codec2 Audio Cross Bridge")
-    root.geometry("980x760")
+    root.geometry("1080x820")
 
     bridge_ref = {"bridge": None}
+    current_config_path = {"path": default_args.config or ""}
 
     vars_map = {
         "peer_host": tk.StringVar(value=default_args.peer_host or "127.0.0.1"),
@@ -590,6 +757,64 @@ def run_gui(default_args: argparse.Namespace) -> None:
             recv_queue_frames=int(vars_map["recv_queue_frames"].get()),
         )
 
+    def apply_config_to_form(data: Dict[str, Any]) -> None:
+        mapping = {
+            "peer_host": "peer_host",
+            "peer_port": "peer_port",
+            "listen_port": "listen_port",
+            "codec_mode": "codec_mode",
+            "vad_threshold": "vad_threshold",
+            "vad_hangover_frames": "vad_hangover_frames",
+            "input_gain": "input_gain",
+            "preemphasis": "preemphasis",
+            "recv_queue_frames": "recv_queue_frames",
+            "input_device": "input_device",
+            "output_device": "output_device",
+            "input_device_name": "input_device_name",
+            "output_device_name": "output_device_name",
+        }
+        for src, dst in mapping.items():
+            if src in data and data[src] is not None:
+                vars_map[dst].set(str(data[src]))
+            elif src in {"input_device", "output_device", "input_device_name", "output_device_name"} and src in data:
+                vars_map[dst].set("")
+
+    def save_config_dialog() -> None:
+        try:
+            cfg = build_config()
+        except Exception as e:
+            messagebox.showerror("Save failed", str(e))
+            return
+        path = filedialog.asksaveasfilename(
+            title="Save config YAML",
+            defaultextension=".yaml",
+            filetypes=[("YAML", "*.yaml *.yml"), ("All files", "*.*")],
+            initialfile=os.path.basename(current_config_path["path"] or "audio_cross_codec2.yaml"),
+        )
+        if not path:
+            return
+        save_config_yaml(path, asdict(cfg))
+        current_config_path["path"] = path
+        config_path_var.set(path)
+        log(f"Config saved: {path}")
+
+    def load_config_dialog() -> None:
+        path = filedialog.askopenfilename(
+            title="Load config YAML",
+            filetypes=[("YAML", "*.yaml *.yml"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            data = load_config_yaml(path)
+            apply_config_to_form(data)
+            current_config_path["path"] = path
+            config_path_var.set(path)
+            log(f"Config loaded: {path}")
+        except Exception as e:
+            messagebox.showerror("Load failed", str(e))
+            log(f"Load failed: {e}")
+
     def start_bridge() -> None:
         if bridge_ref["bridge"] is not None:
             return
@@ -600,6 +825,7 @@ def run_gui(default_args: argparse.Namespace) -> None:
             bridge_ref["bridge"] = bridge
             start_btn.configure(state="disabled")
             stop_btn.configure(state="normal")
+            test_btn.configure(state="normal")
         except Exception as e:
             messagebox.showerror("Start failed", str(e))
             log(f"Start failed: {e}")
@@ -615,10 +841,26 @@ def run_gui(default_args: argparse.Namespace) -> None:
         bridge_ref["bridge"] = None
         start_btn.configure(state="normal")
         stop_btn.configure(state="disabled")
+        test_btn.configure(state="disabled")
+
+    def test_connection() -> None:
+        bridge = bridge_ref.get("bridge")
+        if bridge is None:
+            messagebox.showinfo("Not running", "Start the bridge first.")
+            return
+        try:
+            bridge.send_test()
+        except Exception as e:
+            log(f"Connection test failed to send: {e}")
 
     def refresh_status() -> None:
         bridge = bridge_ref.get("bridge")
-        status_var.set("stopped" if bridge is None else bridge.status_text())
+        if bridge is None:
+            status_var.set("stopped")
+            conn_var.set("link=stopped")
+        else:
+            status_var.set(bridge.status_text())
+            conn_var.set(bridge.connection_state())
         root.after(300, refresh_status)
 
     def on_close() -> None:
@@ -657,28 +899,52 @@ def run_gui(default_args: argparse.Namespace) -> None:
             ttk.Entry(form, textvariable=vars_map[key]).grid(row=row, column=1, sticky="ew", padx=4, pady=4)
         row += 1
 
-    ttk.Separator(form, orient="horizontal").grid(row=row, column=0, columnspan=3, sticky="ew", pady=(8, 8))
+    ttk.Separator(form, orient="horizontal").grid(row=row, column=0, columnspan=4, sticky="ew", pady=(8, 8))
     row += 1
 
     ttk.Label(form, text="Input device name").grid(row=row, column=0, sticky="w", padx=4, pady=4)
     input_combo = ttk.Combobox(form, textvariable=vars_map["input_device_name"])
     input_combo.grid(row=row, column=1, sticky="ew", padx=4, pady=4)
-    ttk.Button(form, text="Use default", command=lambda: (vars_map["input_device_name"].set(""), vars_map["input_device"].set(""))).grid(row=row, column=2, sticky="ew", padx=4, pady=4)
+    ttk.Button(
+        form,
+        text="Use default",
+        command=lambda: (vars_map["input_device_name"].set(""), vars_map["input_device"].set("")),
+    ).grid(row=row, column=2, sticky="ew", padx=4, pady=4)
     row += 1
 
     ttk.Label(form, text="Input device id").grid(row=row, column=0, sticky="w", padx=4, pady=4)
     ttk.Entry(form, textvariable=vars_map["input_device"]).grid(row=row, column=1, sticky="ew", padx=4, pady=4)
-    ttk.Label(form, text="Name優先、空ならid、両方空なら既定").grid(row=row, column=2, sticky="w", padx=4, pady=4)
+    ttk.Label(form, text="Name優先、空ならid、両方空なら既定").grid(row=row, column=2, columnspan=2, sticky="w", padx=4, pady=4)
     row += 1
 
     ttk.Label(form, text="Output device name").grid(row=row, column=0, sticky="w", padx=4, pady=4)
     output_combo = ttk.Combobox(form, textvariable=vars_map["output_device_name"])
     output_combo.grid(row=row, column=1, sticky="ew", padx=4, pady=4)
-    ttk.Button(form, text="Use default", command=lambda: (vars_map["output_device_name"].set(""), vars_map["output_device"].set(""))).grid(row=row, column=2, sticky="ew", padx=4, pady=4)
+    ttk.Button(
+        form,
+        text="Use default",
+        command=lambda: (vars_map["output_device_name"].set(""), vars_map["output_device"].set("")),
+    ).grid(row=row, column=2, sticky="ew", padx=4, pady=4)
     row += 1
 
     ttk.Label(form, text="Output device id").grid(row=row, column=0, sticky="w", padx=4, pady=4)
     ttk.Entry(form, textvariable=vars_map["output_device"]).grid(row=row, column=1, sticky="ew", padx=4, pady=4)
+    row += 1
+
+    ttk.Separator(form, orient="horizontal").grid(row=row, column=0, columnspan=4, sticky="ew", pady=(8, 8))
+    row += 1
+
+    config_path_var = tk.StringVar(value=current_config_path["path"])
+    conn_var = tk.StringVar(value="link=stopped")
+
+    ttk.Label(form, text="Config file").grid(row=row, column=0, sticky="w", padx=4, pady=4)
+    ttk.Entry(form, textvariable=config_path_var).grid(row=row, column=1, sticky="ew", padx=4, pady=4)
+    ttk.Button(form, text="Load YAML", command=load_config_dialog).grid(row=row, column=2, sticky="ew", padx=4, pady=4)
+    ttk.Button(form, text="Save YAML", command=save_config_dialog).grid(row=row, column=3, sticky="ew", padx=4, pady=4)
+    row += 1
+
+    ttk.Label(form, text="Connection").grid(row=row, column=0, sticky="w", padx=4, pady=4)
+    ttk.Label(form, textvariable=conn_var).grid(row=row, column=1, columnspan=3, sticky="w", padx=4, pady=4)
 
     form.columnconfigure(1, weight=1)
     input_combo.bind("<<ComboboxSelected>>", lambda _e: sync_name_to_id("input"))
@@ -690,8 +956,10 @@ def run_gui(default_args: argparse.Namespace) -> None:
     stop_btn = ttk.Button(btns, text="Stop", command=stop_bridge, state="disabled")
     devices_btn = ttk.Button(btns, text="Show devices", command=lambda: log(list_audio_devices()))
     refresh_btn = ttk.Button(btns, text="Refresh devices", command=refresh_devices)
+    test_btn = ttk.Button(btns, text="Test connection", command=test_connection, state="disabled")
     start_btn.pack(side="left", padx=4)
     stop_btn.pack(side="left", padx=4)
+    test_btn.pack(side="left", padx=4)
     devices_btn.pack(side="left", padx=4)
     refresh_btn.pack(side="left", padx=4)
 
@@ -703,9 +971,11 @@ def run_gui(default_args: argparse.Namespace) -> None:
         text=(
             "Mode guide: 3200=least degraded, 1200=most compressed. "
             "Input and output devices can be selected separately by name or by id. "
-            "Name is matched first. Leave both empty to use the system default."
+            "Name is matched first. Leave both empty to use the system default. "
+            "Use Test connection after both sides are started. Saving/loading YAML stores ports, peer host, "
+            "codec and device selection."
         ),
-        wraplength=920,
+        wraplength=1020,
         justify="left",
     )
     notes.pack(fill="x", pady=(0, 8))
@@ -723,10 +993,35 @@ def run_gui(default_args: argparse.Namespace) -> None:
 # CLI
 # =========================
 
+def build_default_arg_map() -> Dict[str, Any]:
+    return {
+        "peer_host": "127.0.0.1",
+        "peer_port": 5001,
+        "listen_port": 5000,
+        "codec_mode": "1300",
+        "samplerate": 8000,
+        "input_device": None,
+        "output_device": None,
+        "input_device_name": None,
+        "output_device_name": None,
+        "vad_threshold": 700,
+        "vad_hangover_frames": 2,
+        "input_gain": 1.0,
+        "preemphasis": 0.0,
+        "recv_queue_frames": 4,
+        "config": None,
+        "save_config": None,
+        "list_devices": False,
+        "test_connection": False,
+        "gui": False,
+    }
+
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Codec2 bidirectional low-bandwidth audio bridge")
     p.add_argument("--gui", action="store_true", help="Launch Tk GUI")
+    p.add_argument("--config", type=str, default=None, help="Load YAML config")
+    p.add_argument("--save-config", type=str, default=None, help="Save current effective config YAML and continue")
     p.add_argument("--peer-host", type=str, default="127.0.0.1")
     p.add_argument("--peer-port", type=int, default=5001)
     p.add_argument("--listen-port", type=int, default=5000)
@@ -746,15 +1041,27 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--preemphasis", type=float, default=0.0)
     p.add_argument("--recv-queue-frames", type=int, default=4)
     p.add_argument("--list-devices", action="store_true")
+    p.add_argument("--test-connection", action="store_true",
+                   help="After start, send one test packet and print RTT when reply arrives")
     return p.parse_args()
 
 
-def run_cli(args: argparse.Namespace) -> int:
-    if args.list_devices:
-        print(list_audio_devices())
-        return 0
+def apply_config_to_args(args: argparse.Namespace) -> argparse.Namespace:
+    if not args.config:
+        return args
+    cfg = load_config_yaml(args.config)
+    defaults = build_default_arg_map()
+    for key, value in cfg.items():
+        attr = key
+        if not hasattr(args, attr):
+            continue
+        if getattr(args, attr) == defaults.get(attr):
+            setattr(args, attr, value)
+    return args
 
-    cfg = AudioConfig(
+
+def effective_config_from_args(args: argparse.Namespace) -> AudioConfig:
+    return AudioConfig(
         peer_host=args.peer_host,
         peer_port=args.peer_port,
         listen_port=args.listen_port,
@@ -770,9 +1077,24 @@ def run_cli(args: argparse.Namespace) -> int:
         preemphasis=args.preemphasis,
         recv_queue_frames=args.recv_queue_frames,
     )
+
+
+def run_cli(args: argparse.Namespace) -> int:
+    if args.list_devices:
+        print(list_audio_devices())
+        return 0
+
+    cfg = effective_config_from_args(args)
+    if args.save_config:
+        save_config_yaml(args.save_config, asdict(cfg))
+        print(f"Saved config: {args.save_config}", flush=True)
+
     bridge = AudioBridge(cfg)
     bridge.start()
-    print("Press Ctrl+C to stop.")
+    print("Press Ctrl+C to stop.", flush=True)
+    if args.test_connection:
+        time.sleep(0.3)
+        bridge.send_test()
     try:
         while True:
             time.sleep(1.0)
@@ -786,6 +1108,7 @@ def run_cli(args: argparse.Namespace) -> int:
 
 if __name__ == "__main__":
     args = parse_args()
+    args = apply_config_to_args(args)
     if args.gui or len(sys.argv) == 1:
         run_gui(args)
     else:
