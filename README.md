@@ -1,3 +1,4 @@
+(This repository is under development)
 # Codec2 Audio Cross Bridge
 
 Ubuntu/Linux 向けの、双方向マイク/スピーカー交換用のオフライン音声ツールです。
